@@ -1,0 +1,6 @@
+streamlit>=1.36
+openai>=1.40
+google-cloud-bigquery>=3.25
+google-auth>=2.30
+pandas>=2.2
+pyarrow>=15
