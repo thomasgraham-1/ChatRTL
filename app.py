@@ -285,8 +285,7 @@ typed_items AS (
 def call_openai(model: str, messages: List[Dict[str, str]]) -> str:
     resp = client.chat.completions.create(
         model=model,
-        messages=messages,
-        max_tokens=2000
+        messages=messages
     )
     return resp.choices[0].message.content.strip()
 
