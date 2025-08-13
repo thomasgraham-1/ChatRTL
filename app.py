@@ -306,9 +306,14 @@ typed_items AS (
   FROM `{BQ_PROJECT}.{BQ_DATASET}.{ITEM_TABLE}`
 )"""
 
-def call_openai(model: str, messages: List[Dict[str, str]], temperature: float = 0.1) -> str:
-    resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+def call_openai(model: str, messages: List[Dict[str, str]]) -> str:
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0
+    )
     return resp.choices[0].message.content.strip()
+
 
 def model_json_for_sql(question: str) -> Dict[str, Any]:
     sys = {"role": "system", "content": "Return ONLY valid JSON. No prose.\n" + HUX_CONTEXT}
