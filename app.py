@@ -309,8 +309,7 @@ typed_items AS (
 def call_openai(model: str, messages: List[Dict[str, str]]) -> str:
     resp = client.chat.completions.create(
         model=model,
-        messages=messages,
-        temperature=0
+        messages=messages
     )
     return resp.choices[0].message.content.strip()
 
@@ -387,7 +386,7 @@ Question:
 """.strip(),
     }
 
-    txt = call_openai(OPENAI_MODEL_SQL, [sys, example_user, example_assistant, user], temperature=0)
+    txt = call_openai(OPENAI_MODEL_SQL, [sys, example_user, example_assistant, user])
     m = re.search(r"\{.*\}\s*$", txt, re.DOTALL)
     raw = m.group(0) if m else txt
     return json.loads(raw.strip("`").strip())
@@ -402,7 +401,7 @@ def analyze_rows(question: str, rows: List[Dict[str, Any]], sql: str) -> str:
         "note": f"Total rows fetched (capped at {MAX_ROWS_DEFAULT})."
     }
     user = {"role": "user", "content": json.dumps(preview, ensure_ascii=False)}
-    return call_openai(OPENAI_MODEL_ANALYSIS, [sys, user], temperature=0)
+    return call_openai(OPENAI_MODEL_ANALYSIS, [sys, user])
 
 # ────────────────────────────────────────────────────────────────────────────
 # UI
