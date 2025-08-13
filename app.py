@@ -23,6 +23,7 @@ st.set_page_config(page_title="ChatRTL Analytics Copilot", page_icon="📊", lay
 #   project = "mmprod"
 #   dataset = "mm_prod"
 #   table   = "sales_inv_master"
+#   item_table = "item_vendor_master_summary"   # optional override
 #   OPENAI_API_KEY = "sk-..."
 #   OPENAI_MODEL_SQL = "gpt-4o-mini"
 #   OPENAI_MODEL_ANALYSIS = "gpt-4o-mini"
@@ -39,6 +40,7 @@ OPENAI_MODEL_ANALYSIS = st.secrets.get("OPENAI_MODEL_ANALYSIS", os.getenv("OPENA
 BQ_PROJECT = st.secrets.get("bigquery", {}).get("project", os.getenv("BQ_PROJECT", "mmprod"))
 BQ_DATASET = st.secrets.get("bigquery", {}).get("dataset", os.getenv("BQ_DATASET", "mm_prod"))
 BQ_TABLE   = st.secrets.get("bigquery", {}).get("table",   os.getenv("BQ_TABLE",   "sales_inv_master"))
+ITEM_TABLE = st.secrets.get("bigquery", {}).get("item_table", os.getenv("BQ_ITEM_TABLE", "item_vendor_master_summary"))
 
 if "gcp_service_account" not in st.secrets:
     st.error("Missing [gcp_service_account] block in secrets. Paste your service account JSON there.")
@@ -56,33 +58,38 @@ HUX_CONTEXT = """
 You are the Hux Partners Analytics Copilot. You specialize in Walmart supplier
 analytics, producing BigQuery SQL and interpreting results for executives.
 
-Data source: mmprod.mm_prod.sales_inv_master (POS + inventory + movement).
-Always consider these metric families when applicable:
+Primary sources in the same dataset:
+- mmprod.mm_prod.sales_inv_master            -> exposed as CTE `typed_sales`
+- mmprod.mm_prod.item_vendor_master_summary  -> exposed as CTE `typed_items`
 
-Sales Performance
-- pos_sales_this_year / pos_sales_last_year
-- pos_quantity_this_year / pos_quantity_last_year
-- YOY % change, top/bottom SKUs or suppliers
+Join guidance:
+- Default join key: typed_sales.prime_item_number = typed_items.prime_item_number
+- Prefer LEFT JOIN from `typed_sales` to bring in attributes:
+  brand_name, prime_item_description, Supplier, unit_cost_amount, item_status_code, item_status_change_date.
 
-Inventory Health
-- store_on_hand_quantity_this_year / _last_year
-- instock_percentage_this_year / _last_year
-- repl_instock_percentage_this_year / _last_year
+Column pairing rules (THIS vs LAST YEAR):
+- Sales: pos_sales_this_year ↔ pos_sales_last_year
+- Units: pos_quantity_this_year ↔ pos_quantity_last_year
+- In‑stock: instock_percentage_this_year ↔ instock_percentage_last_year
+- Repl in‑stock: repl_instock_percentage_this_year ↔ repl_instock_percentage_last_year
+- On‑hand qty: store_on_hand_quantity_this_year ↔ store_on_hand_quantity_last_year
+- Received qty: mtr_received_quantity_this_year ↔ mtr_received_quantity_last_year
+- Transferred qty: mtr_transferred_quantity_this_year ↔ mtr_transferred_quantity_last_year
+(If both *_this_year and *_last_year exist, ALWAYS compare those two.)
 
-Supply Chain / Movement
-- mtr_received_quantity_this_year / _last_year
-- mtr_transferred_quantity_this_year / _last_year
-- store_in_transit_* , store_in_warehouse_*
+YoY templates:
+- yoy_abs = ty - ly
+- yoy_pct = SAFE_DIVIDE(ty - ly, NULLIF(ly, 0))
 
-Markdowns & Returns
-- mkdn_qty_yoy_percentage, mkdwn_amt_yoy_percentage
-- returns (defective/overstock/recall/vendor/return center)
+Time windows with walmart_calendar_week (INT):
+- Treat “past N weeks” as the N most recent integer weeks.
+- Anchor on max week in the data:
+    WITH cw AS (SELECT MAX(SAFE_CAST(walmart_calendar_week AS INT64)) AS max_wk FROM typed_sales)
+    ... WHERE SAFE_CAST(walmart_calendar_week AS INT64) BETWEEN cw.max_wk - (N - 1) AND cw.max_wk
 
-Write concise, client-ready insights:
-- Compare to last year where possible
-- Call out notable highs/lows
-- Flag operational risks (e.g., low in-stock %, high returns)
-- State assumptions briefly at the end if needed
+Constraints:
+- SELECT‑only (no DDL/DML). Clear aliases. Prefer simple grouping/window functions.
+- Compare to last year where possible, call out highs/lows and operational risks (e.g., low in‑stock %, high returns).
 """.strip()
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -143,6 +150,18 @@ RAW_COLS = [
 ]
 KEY_COLS = {"supplier_code","walmart_calendar_week","store_number","prime_item_number"}
 
+# Items table columns
+RAW_COLS_ITEMS = [
+    "prime_item_number","item_status_code","Supplier","item_status_change_date",
+    "base_unit_retail_amount","brand_name","modular_based_merchandising_code",
+    "modular_based_merchandising_description","never_out_indicator","prime_item_description",
+    "private_label_indicator","rfid_indicator","rppc_indicator",
+    "replenishment_subtype_code","replenishment_subtype_description",
+    "replenishment_unit_indicator","unit_cost_amount","vendor_name","vendor_number","vendor_number_9_digit"
+]
+KEY_COLS_ITEMS = {"prime_item_number"}
+NUMERICISH_ITEMS = {"base_unit_retail_amount","unit_cost_amount"}
+
 DDL_DML_PATTERN = re.compile(r"\b(CREATE|ALTER|DROP|TRUNCATE|MERGE|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -157,7 +176,7 @@ def get_clients():
 client, bq = get_clients()
 
 # ────────────────────────────────────────────────────────────────────────────
-# Helpers ported from your script
+# Helpers
 # ────────────────────────────────────────────────────────────────────────────
 def _d(msg: str):
     if DEBUG: st.write(f"[debug] {msg}")
@@ -190,7 +209,7 @@ def is_query_safe(sql: str) -> Tuple[bool, str]:
 
 def enforce_limit(sql: str, max_rows: int) -> str:
     if re.search(r"\bLIMIT\s+\d+\b", sql, re.IGNORECASE): return sql
-    if re.search(r"\bGROUP\s+BY\b|\bcount\(|\bsum\(|\bavg\(|\bmin\(|\bmax\(", sql, re.IGNORECASE): return sql
+    if re.search(r"\bGROUP\s+BY\b|\bcount\(|\bsum\(|\bavg\(|\bmin\(|\bmax\(|\bQUALIFY\b", sql, re.IGNORECASE): return sql
     return sql.rstrip().rstrip(";") + f" LIMIT {max_rows}"
 
 def dry_run(sql: str):
@@ -201,23 +220,45 @@ def run_sql(sql: str, max_rows: int) -> List[Dict[str, Any]]:
     it = job.result(max_results=max_rows)
     return [dict(row) for row in it]
 
-def build_typed_cte() -> str:
-    select_lines = []
+# Build BOTH typed CTEs (sales + items)
+def build_typed_ctes() -> str:
+    # sales/master
+    sales_lines = []
     for c in RAW_COLS:
         if c in KEY_COLS:
             if c == "walmart_calendar_week":
-                select_lines.append(f"SAFE_CAST({c} AS INT64) AS {c}")
+                sales_lines.append(f"SAFE_CAST({c} AS INT64) AS {c}")
             else:
-                select_lines.append(c)
+                sales_lines.append(c)
         else:
-            select_lines.append(
-                f"SAFE_CAST(REGEXP_REPLACE({c}, r'[%,$]', '') AS FLOAT64) AS {c}"
+            # robust: string-clean first, then numeric
+            sales_lines.append(
+                f"SAFE_CAST(REGEXP_REPLACE(CAST({c} AS STRING), r'[,%$]', '') AS FLOAT64) AS {c}"
             )
-    select_block = ",\n    ".join(select_lines)
+    sales_block = ",\n    ".join(sales_lines)
+
+    # items/vendor – keep strings as STRING, coerce numeric-ish to FLOAT64
+    item_lines = []
+    for c in RAW_COLS_ITEMS:
+        if c in KEY_COLS_ITEMS:
+            item_lines.append(c)
+        elif c in NUMERICISH_ITEMS:
+            item_lines.append(
+                f"SAFE_CAST(REGEXP_REPLACE(CAST({c} AS STRING), r'[,%$]', '') AS FLOAT64) AS {c}"
+            )
+        else:
+            item_lines.append(f"CAST({c} AS STRING) AS {c}")
+    item_block = ",\n    ".join(item_lines)
+
     return f"""WITH typed_sales AS (
   SELECT
-    {select_block}
+    {sales_block}
   FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+),
+typed_items AS (
+  SELECT
+    {item_block}
+  FROM `{BQ_PROJECT}.{BQ_DATASET}.{ITEM_TABLE}`
 )"""
 
 def call_openai(model: str, messages: List[Dict[str, str]], temperature: float = 0.1) -> str:
@@ -226,27 +267,77 @@ def call_openai(model: str, messages: List[Dict[str, str]], temperature: float =
 
 def model_json_for_sql(question: str) -> Dict[str, Any]:
     sys = {"role": "system", "content": "Return ONLY valid JSON. No prose.\n" + HUX_CONTEXT}
-    cte = build_typed_cte()
+    ctes = build_typed_ctes()
+
+    # Few-shot example to lock in YoY + join behavior
+    example_user = {
+        "role": "user",
+        "content": f"""
+Write BigQuery Standard SQL using these CTEs and query from them:
+
+{ctes}
+
+Rules:
+- Do NOT use DDL/DML.
+- Use walmart_calendar_week (INT) for week windows anchored on the max week.
+- You MAY join `typed_sales` to `typed_items` on prime_item_number for descriptions/brand/Supplier.
+- Return ONLY JSON: {{"sql":"<query>", "rationale":"<brief>"}}
+
+Question:
+\"\"\"Top 10 SKUs by YoY POS sales growth in the last 8 weeks with item descriptions\"\"\"
+""".strip(),
+    }
+
+    example_sql = f"""
+{ctes}
+, cw AS (SELECT MAX(SAFE_CAST(walmart_calendar_week AS INT64)) AS max_wk FROM typed_sales)
+, filt AS (
+  SELECT s.*
+  FROM typed_sales s, cw
+  WHERE SAFE_CAST(s.walmart_calendar_week AS INT64) BETWEEN cw.max_wk - 7 AND cw.max_wk
+)
+SELECT
+  s.prime_item_number,
+  i.prime_item_description,
+  i.brand_name,
+  SUM(s.pos_sales_this_year) AS ty_sales,
+  SUM(s.pos_sales_last_year) AS ly_sales,
+  (SUM(s.pos_sales_this_year) - SUM(s.pos_sales_last_year)) AS yoy_abs,
+  SAFE_DIVIDE(SUM(s.pos_sales_this_year) - SUM(s.pos_sales_last_year), NULLIF(SUM(s.pos_sales_last_year), 0)) AS yoy_pct
+FROM filt s
+LEFT JOIN typed_items i
+  ON s.prime_item_number = i.prime_item_number
+GROUP BY s.prime_item_number, i.prime_item_description, i.brand_name
+ORDER BY yoy_pct DESC
+LIMIT 10
+""".strip()
+
+    example_assistant = {
+        "role": "assistant",
+        "content": json.dumps({
+            "sql": example_sql,
+            "rationale": "Anchors last 8 weeks, joins to typed_items for descriptions/brand, and computes YoY with SAFE_DIVIDE."
+        })
+    }
+
     user = {
         "role": "user",
         "content": f"""
-Write **BigQuery Standard SQL** to answer the business question using only this dataset:
+Write **BigQuery Standard SQL** that starts with these CTEs and then queries from them:
 
-- Allowed prefix: {BQ_PROJECT}.{BQ_DATASET}
-- **Always begin** the query with this CTE verbatim, then query from `typed_sales`:
-{cte}
+{ctes}
 
 Rules:
-- Do NOT use DDL/DML (CREATE/ALTER/DROP/INSERT/UPDATE/DELETE/MERGE).
-- Prefer simple grouping, window functions, and clear aliases.
-- If a time window like "past 52 weeks" is requested, interpret weeks using walmart_calendar_week (INT).
-- Return ONLY JSON in the form: {{"sql": "<query>", "rationale":"<brief>"}}
+- SELECT‑only. Use walmart_calendar_week for windows anchored on the max week.
+- You MAY join `typed_sales` to `typed_items` on prime_item_number for attributes like brand/description/Supplier.
+- Return ONLY JSON as: {{"sql":"<query>", "rationale":"<brief>"}}
 
 Question:
 \"\"\"{question}\"\"\"
 """.strip(),
     }
-    txt = call_openai(OPENAI_MODEL_SQL, [sys, user], temperature=0.1)
+
+    txt = call_openai(OPENAI_MODEL_SQL, [sys, example_user, example_assistant, user], temperature=0.1)
     m = re.search(r"\{.*\}\s*$", txt, re.DOTALL)
     raw = m.group(0) if m else txt
     return json.loads(raw.strip("`").strip())
@@ -267,7 +358,7 @@ def analyze_rows(question: str, rows: List[Dict[str, Any]], sql: str) -> str:
 # UI
 # ────────────────────────────────────────────────────────────────────────────
 st.title("📊 ChatRTL Analytics Copilot")
-st.caption(f"Dataset: `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`")
+st.caption(f"Datasets: `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}` + `{BQ_PROJECT}.{BQ_DATASET}.{ITEM_TABLE}`")
 
 with st.sidebar:
     st.subheader("Settings")
@@ -280,6 +371,7 @@ with st.sidebar:
         OPENAI_MODEL_ANALYSIS = model_analysis
 
     st.markdown("---")
+    st.write("Allowed table prefixes:", ", ".join(ALLOWED_PREFIXES))
     if st.button("🔎 Test BigQuery connection"):
         try:
             rows = run_sql("SELECT 1 AS ok", 1)
@@ -290,8 +382,8 @@ with st.sidebar:
 tabs = st.tabs(["Ask a question", "Run manual SQL", "Diagnostics"])
 
 with tabs[0]:
-    st.subheader("Ask about sales/inventory/movement")
-    prompt = st.text_area("Question", value="Top 10 SKUs by YoY POS sales growth in the last 8 weeks.", height=100)
+    st.subheader("Ask about sales/inventory/movement (+ item attributes)")
+    prompt = st.text_area("Question", value="Top 10 SKUs by YoY POS sales growth in the last 8 weeks with item descriptions.", height=100)
     run_q = st.button("Generate & Run", type="primary")
     if run_q and prompt.strip():
         with st.status("Generating SQL with LLM...", expanded=False) as status:
@@ -390,5 +482,5 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Diagnostics")
     st.write("Allowed table prefixes:", ", ".join(ALLOWED_PREFIXES))
-    with st.expander("Typed CTE preview"):
-        st.code(build_typed_cte(), language="sql")
+    with st.expander("Typed CTEs preview"):
+        st.code(build_typed_ctes(), language="sql")
