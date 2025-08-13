@@ -17,24 +17,25 @@ st.set_page_config(page_title="ChatRTL Analytics Copilot", page_icon="📊", lay
 
 # ────────────────────────────────────────────────────────────────────────────
 # Config & Secrets
-# Preferred: set in Streamlit secrets UI (Cloud) or .streamlit/secrets.toml (local)
+# ────────────────────────────────────────────────────────────────────────────
+# In .streamlit/secrets.toml:
 #   [gcp_service_account]  # paste your service account JSON as TOML keys
 #   [bigquery]
 #   project = "mmprod"
 #   dataset = "mm_prod"
 #   table   = "sales_inv_master"
-#   item_table = "item_vendor_master_summary"   # optional override
+#   item_table = "item_vendor_master_summary"
 #   OPENAI_API_KEY = "sk-..."
-#   OPENAI_MODEL_SQL = "gpt-4o-mini"
-#   OPENAI_MODEL_ANALYSIS = "gpt-4o-mini"
-# ────────────────────────────────────────────────────────────────────────────
+#   OPENAI_MODEL_SQL = "gpt-5"
+#   OPENAI_MODEL_ANALYSIS = "gpt-5"
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY. Add it to Streamlit secrets.")
     st.stop()
 
-OPENAI_MODEL_SQL = st.secrets.get("OPENAI_MODEL_SQL", os.getenv("OPENAI_MODEL_SQL", "gpt-4o-mini"))
-OPENAI_MODEL_ANALYSIS = st.secrets.get("OPENAI_MODEL_ANALYSIS", os.getenv("OPENAI_MODEL_ANALYSIS", "gpt-4o-mini"))
+# Default to GPT‑5; user can override in sidebar
+OPENAI_MODEL_SQL = st.secrets.get("OPENAI_MODEL_SQL", os.getenv("OPENAI_MODEL_SQL", "gpt-5"))
+OPENAI_MODEL_ANALYSIS = st.secrets.get("OPENAI_MODEL_ANALYSIS", os.getenv("OPENAI_MODEL_ANALYSIS", "gpt-5"))
 
 # BigQuery identifiers
 BQ_PROJECT = st.secrets.get("bigquery", {}).get("project", os.getenv("BQ_PROJECT", "mmprod"))
@@ -55,19 +56,18 @@ GCP_CREDENTIALS = service_account.Credentials.from_service_account_info(
 # Business Context / Prompting
 # ────────────────────────────────────────────────────────────────────────────
 HUX_CONTEXT = """
-You are the Hux Partners Analytics Copilot. You specialize in Walmart supplier
-analytics, producing BigQuery SQL and interpreting results for executives.
+You are the Hux Partners Analytics Copilot. You specialize in Walmart supplier analytics,
+producing BigQuery SQL and interpreting results for executives.
 
-Primary sources in the same dataset:
-- mmprod.mm_prod.sales_inv_master            -> exposed as CTE `typed_sales`
-- mmprod.mm_prod.item_vendor_master_summary  -> exposed as CTE `typed_items`
+Tables (assume these CTEs already exist in the session):
+- typed_sales  (from mmprod.mm_prod.sales_inv_master)
+- typed_items  (from mmprod.mm_prod.item_vendor_master_summary)
 
 Join guidance:
 - Default join key: typed_sales.prime_item_number = typed_items.prime_item_number
-- Prefer LEFT JOIN from `typed_sales` to bring in attributes:
-  brand_name, prime_item_description, Supplier, unit_cost_amount, item_status_code, item_status_change_date.
+- Prefer LEFT JOIN from typed_sales to bring: brand_name, prime_item_description, Supplier, unit_cost_amount, item_status_code, item_status_change_date.
 
-Column pairing rules (THIS vs LAST YEAR):
+Column pairing rules (THIS vs LAST YEAR) — ALWAYS compare these pairs when both exist:
 - Sales: pos_sales_this_year ↔ pos_sales_last_year
 - Units: pos_quantity_this_year ↔ pos_quantity_last_year
 - In‑stock: instock_percentage_this_year ↔ instock_percentage_last_year
@@ -75,21 +75,20 @@ Column pairing rules (THIS vs LAST YEAR):
 - On‑hand qty: store_on_hand_quantity_this_year ↔ store_on_hand_quantity_last_year
 - Received qty: mtr_received_quantity_this_year ↔ mtr_received_quantity_last_year
 - Transferred qty: mtr_transferred_quantity_this_year ↔ mtr_transferred_quantity_last_year
-(If both *_this_year and *_last_year exist, ALWAYS compare those two.)
 
-YoY templates:
+YoY formulas:
 - yoy_abs = ty - ly
 - yoy_pct = SAFE_DIVIDE(ty - ly, NULLIF(ly, 0))
 
 Time windows with walmart_calendar_week (INT):
-- Treat “past N weeks” as the N most recent integer weeks.
-- Anchor on max week in the data:
+- “past N weeks” = N most recent integer weeks.
+- Anchor on max week in data:
     WITH cw AS (SELECT MAX(SAFE_CAST(walmart_calendar_week AS INT64)) AS max_wk FROM typed_sales)
     ... WHERE SAFE_CAST(walmart_calendar_week AS INT64) BETWEEN cw.max_wk - (N - 1) AND cw.max_wk
 
 Constraints:
 - SELECT‑only (no DDL/DML). Clear aliases. Prefer simple grouping/window functions.
-- Compare to last year where possible, call out highs/lows and operational risks (e.g., low in‑stock %, high returns).
+- Compare to last year where possible; call out highs/lows and operational risks (e.g., low in‑stock %, high returns).
 """.strip()
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -184,10 +183,7 @@ def _d(msg: str):
     if DEBUG: st.write(f"[debug] {msg}")
 
 def extract_cte_names(sql: str) -> List[str]:
-    """
-    Extract CTE names from the initial WITH block, supporting multiple CTEs.
-    Example: WITH a AS (...), b AS (...), c AS (...) SELECT ...
-    """
+    """Extract CTE names from the initial WITH block (supports multiple CTEs)."""
     m = re.search(r"\bWITH\b\s+(.*?)(?=\)\s*SELECT\b)", sql, re.IGNORECASE | re.DOTALL)
     if not m:
         return []
@@ -197,26 +193,15 @@ def extract_cte_names(sql: str) -> List[str]:
 def is_query_safe(sql: str) -> Tuple[bool, str]:
     if DDL_DML_PATTERN.search(sql):
         return False, "DDL/DML is not allowed."
-
-    # Collect CTE names (from WITH ...) + known allow-list
     discovered_ctes = set(extract_cte_names(sql))
     cte_names = {n.lower() for n in (discovered_ctes | set(ALLOWED_CTE_NAMES))}
-
-    # Find FROM/JOIN refs and normalize tokens
     refs = re.findall(r"(?:FROM|JOIN)\s+([`A-Za-z0-9_$.:-]+)", sql, re.IGNORECASE)
     for r in refs:
-        # normalize: strip backticks/punct, remove aliasing
         clean = r.strip("`").strip(",)").split()[0].lower()
-
-        # Always allow our CTEs and subqueries
         if clean in cte_names or clean.startswith("("):
             continue
-
-        # Block unqualified base tables
         if "." not in clean:
             return False, f"Unqualified table reference '{r}'. Use fully qualified names or a CTE."
-
-        # Enforce allowed dataset prefixes
         allowed = any(clean.startswith(prefix.lower()) for prefix in {p.lower() for p in ALLOWED_PREFIXES})
         if not allowed:
             return False, f"Table '{clean}' is outside allowed datasets."
@@ -234,33 +219,24 @@ def run_sql(sql: str, max_rows: int) -> List[Dict[str, Any]]:
     job = bq.query(sql)
     it = job.result(max_results=max_rows)
     return [dict(row) for row in it]
+
 # Collapse accidental second WITH into a comma continuation of the first WITH
 DOUBLE_WITH_PATTERN = re.compile(r"\)\s*WITH\s+", re.IGNORECASE)
-
 def normalize_with_blocks(sql: str) -> str:
-    """
-    Ensures a single WITH block by replacing ') WITH' -> '),'
-    Handles cases where the model emits a second WITH after initial CTEs.
-    """
+    """Ensure a single WITH block by replacing ') WITH' -> '),'."""
     s = sql.strip().lstrip(";")
-    # Replace all occurrences safely
     while DOUBLE_WITH_PATTERN.search(s):
         s = DOUBLE_WITH_PATTERN.sub("),\n", s, count=1)
     return s
 
-
-# --- Auto-inject required CTEs if missing but referenced
+# Auto-inject required CTEs if missing but referenced
 HAS_CTES_PATTERN = re.compile(r"\bwith\b\s+.*\btyped_sales\b\s+as\s*\(", re.IGNORECASE | re.DOTALL)
 REFS_CTES_PATTERN = re.compile(r"\b(?:from|join)\s+(typed_sales|typed_items)\b", re.IGNORECASE)
-
 def ensure_required_ctes(sql: str) -> str:
-    """
-    If the query references typed_sales/typed_items but doesn't include the CTE
-    definitions, prepend the standard dual-CTE block.
-    """
+    """If query references typed_sales/typed_items but lacks definitions, prepend the dual-CTE block."""
     s = sql.strip().lstrip(";")
     if HAS_CTES_PATTERN.search(s):
-        return s  # CTEs already present
+        return s
     if REFS_CTES_PATTERN.search(s):
         return build_typed_ctes() + "\n" + s
     return s
@@ -276,7 +252,6 @@ def build_typed_ctes() -> str:
             else:
                 sales_lines.append(c)
         else:
-            # robust: string-clean first, then numeric
             sales_lines.append(
                 f"SAFE_CAST(REGEXP_REPLACE(CAST({c} AS STRING), r'[,%$]', '') AS FLOAT64) AS {c}"
             )
@@ -306,87 +281,37 @@ typed_items AS (
   FROM `{BQ_PROJECT}.{BQ_DATASET}.{ITEM_TABLE}`
 )"""
 
+# Single OpenAI call helper (GPT‑5 ready, with timeouts)
 def call_openai(model: str, messages: List[Dict[str, str]]) -> str:
     resp = client.chat.completions.create(
         model=model,
-        messages=messages
+        messages=messages,
+        max_tokens=1200,         # keep generous but not huge
+        request_timeout=30       # fail fast if the model hangs
     )
     return resp.choices[0].message.content.strip()
 
-
 def model_json_for_sql(question: str) -> Dict[str, Any]:
+    """
+    Lean prompt for speed: we DO NOT inline the big CTE text.
+    The model is told to assume typed_sales/typed_items exist and to return JSON.
+    Our runtime will inject CTEs if missing.
+    """
     sys = {"role": "system", "content": "Return ONLY valid JSON. No prose.\n" + HUX_CONTEXT}
-    ctes = build_typed_ctes()
-
-    # Few-shot example to lock in YoY + join behavior
-    example_user = {
-        "role": "user",
-        "content": f"""
-Write BigQuery Standard SQL using these CTEs and query from them:
-
-{ctes}
-
-Rules:
-- Do NOT use DDL/DML.
-- Use walmart_calendar_week (INT) for week windows anchored on the max week.
-- You MAY join `typed_sales` to `typed_items` on prime_item_number for descriptions/brand/Supplier.
-- Return ONLY JSON: {{"sql":"<query>", "rationale":"<brief>"}}
-
-Question:
-\"\"\"Top 10 SKUs by YoY POS sales growth in the last 8 weeks with item descriptions\"\"\"
-""".strip(),
-    }
-
-    example_sql = f"""
-{ctes}
-, cw AS (SELECT MAX(SAFE_CAST(walmart_calendar_week AS INT64)) AS max_wk FROM typed_sales)
-, filt AS (
-  SELECT s.*
-  FROM typed_sales s, cw
-  WHERE SAFE_CAST(s.walmart_calendar_week AS INT64) BETWEEN cw.max_wk - 7 AND cw.max_wk
-)
-SELECT
-  s.prime_item_number,
-  i.prime_item_description,
-  i.brand_name,
-  SUM(s.pos_sales_this_year) AS ty_sales,
-  SUM(s.pos_sales_last_year) AS ly_sales,
-  (SUM(s.pos_sales_this_year) - SUM(s.pos_sales_last_year)) AS yoy_abs,
-  SAFE_DIVIDE(SUM(s.pos_sales_this_year) - SUM(s.pos_sales_last_year), NULLIF(SUM(s.pos_sales_last_year), 0)) AS yoy_pct
-FROM filt s
-LEFT JOIN typed_items i
-  ON s.prime_item_number = i.prime_item_number
-GROUP BY s.prime_item_number, i.prime_item_description, i.brand_name
-ORDER BY yoy_pct DESC
-LIMIT 10
-""".strip()
-
-    example_assistant = {
-        "role": "assistant",
-        "content": json.dumps({
-            "sql": example_sql,
-            "rationale": "Anchors last 8 weeks, joins to typed_items for descriptions/brand, and computes YoY with SAFE_DIVIDE."
-        })
-    }
-
     user = {
         "role": "user",
         "content": f"""
-Write **BigQuery Standard SQL** that starts with these CTEs and then queries from them:
-
-{ctes}
-
-Rules:
-- SELECT‑only. Use walmart_calendar_week for windows anchored on the max week.
-- You MAY join `typed_sales` to `typed_items` on prime_item_number for attributes like brand/description/Supplier.
-- Return ONLY JSON as: {{"sql":"<query>", "rationale":"<brief>"}}
+Write BigQuery **Standard SQL** to answer the question using the assumed CTEs:
+- typed_sales (metrics) and typed_items (attributes).
+- You MAY LEFT JOIN typed_items on prime_item_number for brand/description/Supplier.
+- Use walmart_calendar_week for week windows anchored on the max week (see context).
+- SELECT-only; no DDL/DML.
+- Return ONLY JSON: {{"sql":"<query>", "rationale":"<brief>"}}
 
 Question:
-\"\"\"{question}\"\"\"
-""".strip(),
+\"\"\"{question}\"\"\"""".strip()
     }
-
-    txt = call_openai(OPENAI_MODEL_SQL, [sys, example_user, example_assistant, user])
+    txt = call_openai(OPENAI_MODEL_SQL, [sys, user])
     m = re.search(r"\{.*\}\s*$", txt, re.DOTALL)
     raw = m.group(0) if m else txt
     return json.loads(raw.strip("`").strip())
@@ -443,7 +368,7 @@ with tabs[0]:
                 if not sql:
                     st.error("Model did not return SQL.")
                 else:
-                    # Ensure required CTEs are present if referenced
+                    # Ensure required CTEs present and with-blocks normalized
                     sql = ensure_required_ctes(sql)
                     sql = normalize_with_blocks(sql)
 
@@ -501,8 +426,9 @@ with tabs[1]:
         if not sql:
             st.warning("Enter a SQL query.")
         else:
-            # Ensure required CTEs are present if referenced
+            # Ensure required CTEs present and with-blocks normalized
             sql = ensure_required_ctes(sql)
+            sql = normalize_with_blocks(sql)
 
             ok, msg = is_query_safe(sql)
             if not ok:
