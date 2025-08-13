@@ -387,7 +387,7 @@ Question:
 """.strip(),
     }
 
-    txt = call_openai(OPENAI_MODEL_SQL, [sys, example_user, example_assistant, user], temperature=0.1)
+    txt = call_openai(OPENAI_MODEL_SQL, [sys, example_user, example_assistant, user], temperature=0)
     m = re.search(r"\{.*\}\s*$", txt, re.DOTALL)
     raw = m.group(0) if m else txt
     return json.loads(raw.strip("`").strip())
@@ -402,7 +402,7 @@ def analyze_rows(question: str, rows: List[Dict[str, Any]], sql: str) -> str:
         "note": f"Total rows fetched (capped at {MAX_ROWS_DEFAULT})."
     }
     user = {"role": "user", "content": json.dumps(preview, ensure_ascii=False)}
-    return call_openai(OPENAI_MODEL_ANALYSIS, [sys, user], temperature=0.2)
+    return call_openai(OPENAI_MODEL_ANALYSIS, [sys, user], temperature=0)
 
 # ────────────────────────────────────────────────────────────────────────────
 # UI
