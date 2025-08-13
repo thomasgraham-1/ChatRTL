@@ -99,6 +99,9 @@ DEBUG = False
 MAX_ROWS_DEFAULT = 200
 OBS_ROWS = 50
 ALLOWED_PREFIXES = {f"{BQ_PROJECT}.{BQ_DATASET}."}
+# Allow-list for known CTE names the model uses
+ALLOWED_CTE_NAMES = {"typed_sales", "typed_items", "cw", "filt"}
+
 
 RAW_COLS = [
     "supplier_code","walmart_calendar_week","store_number","prime_item_number",
@@ -182,33 +185,44 @@ def _d(msg: str):
     if DEBUG: st.write(f"[debug] {msg}")
 
 def extract_cte_names(sql: str) -> List[str]:
-    # Find all CTE names between WITH and the final SELECT
-    # This will match both typed_sales and typed_items
-    cte_block_match = re.search(r"WITH\s+(.*?)\)\s*SELECT", sql, re.IGNORECASE | re.DOTALL)
-    if not cte_block_match:
+    """
+    Extract CTE names from the initial WITH block, supporting multiple CTEs.
+    Example: WITH a AS (...), b AS (...), c AS (...) SELECT ...
+    """
+    m = re.search(r"\bWITH\b\s+(.*?)(?=\)\s*SELECT\b)", sql, re.IGNORECASE | re.DOTALL)
+    if not m:
         return []
-    with_body = cte_block_match.group(1)
+    with_body = m.group(1)
     return [name.lower() for name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", with_body, re.IGNORECASE)]
-
 
 def is_query_safe(sql: str) -> Tuple[bool, str]:
     if DDL_DML_PATTERN.search(sql):
         return False, "DDL/DML is not allowed."
 
-    cte_names = set(extract_cte_names(sql))
+    # Collect CTE names (from WITH ...) + known allow-list
+    discovered_ctes = set(extract_cte_names(sql))
+    cte_names = {n.lower() for n in (discovered_ctes | set(ALLOWED_CTE_NAMES))}
+
+    # Find FROM/JOIN refs and normalize tokens
     refs = re.findall(r"(?:FROM|JOIN)\s+([`A-Za-z0-9_$.:-]+)", sql, re.IGNORECASE)
     for r in refs:
-        clean = r.strip("`")
-        if clean.lower() in cte_names:       # allow CTE refs
+        # normalize: strip backticks/punct, remove aliasing
+        clean = r.strip("`").strip(",)").split()[0].lower()
+
+        # Always allow our CTEs and subqueries
+        if clean in cte_names or clean.startswith("("):
             continue
-        if clean.startswith("("):            # subquery
-            continue
+
+        # Block unqualified base tables
         if "." not in clean:
             return False, f"Unqualified table reference '{r}'. Use fully qualified names or a CTE."
-        ok = any(clean.startswith(prefix) for prefix in ALLOWED_PREFIXES)
-        if not ok:
+
+        # Enforce allowed dataset prefixes
+        allowed = any(clean.startswith(prefix.lower()) for prefix in {p.lower() for p in ALLOWED_PREFIXES})
+        if not allowed:
             return False, f"Table '{clean}' is outside allowed datasets."
     return True, ""
+
 
 def enforce_limit(sql: str, max_rows: int) -> str:
     if re.search(r"\bLIMIT\s+\d+\b", sql, re.IGNORECASE): return sql
