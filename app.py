@@ -182,11 +182,14 @@ def _d(msg: str):
     if DEBUG: st.write(f"[debug] {msg}")
 
 def extract_cte_names(sql: str) -> List[str]:
-    m = re.search(r"\bWITH\b(.*?)(?=\bSELECT\b)", sql, re.IGNORECASE | re.DOTALL)
-    if not m:
+    # Find all CTE names between WITH and the final SELECT
+    # This will match both typed_sales and typed_items
+    cte_block_match = re.search(r"WITH\s+(.*?)\)\s*SELECT", sql, re.IGNORECASE | re.DOTALL)
+    if not cte_block_match:
         return []
-    with_body = m.group(1)
+    with_body = cte_block_match.group(1)
     return [name.lower() for name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", with_body, re.IGNORECASE)]
+
 
 def is_query_safe(sql: str) -> Tuple[bool, str]:
     if DDL_DML_PATTERN.search(sql):
