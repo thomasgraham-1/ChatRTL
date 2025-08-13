@@ -286,8 +286,7 @@ def call_openai(model: str, messages: List[Dict[str, str]]) -> str:
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=1200,         # keep generous but not huge
-        request_timeout=30       # fail fast if the model hangs
+        max_tokens=2000
     )
     return resp.choices[0].message.content.strip()
 
