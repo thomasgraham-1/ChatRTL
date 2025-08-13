@@ -93,7 +93,7 @@ Constraints:
 """.strip()
 
 # ────────────────────────────────────────────────────────────────────────────
-# Constants ported from your script
+# Constants
 # ────────────────────────────────────────────────────────────────────────────
 DEBUG = False
 MAX_ROWS_DEFAULT = 200
@@ -101,7 +101,6 @@ OBS_ROWS = 50
 ALLOWED_PREFIXES = {f"{BQ_PROJECT}.{BQ_DATASET}."}
 # Allow-list for known CTE names the model uses
 ALLOWED_CTE_NAMES = {"typed_sales", "typed_items", "cw", "filt"}
-
 
 RAW_COLS = [
     "supplier_code","walmart_calendar_week","store_number","prime_item_number",
@@ -223,7 +222,6 @@ def is_query_safe(sql: str) -> Tuple[bool, str]:
             return False, f"Table '{clean}' is outside allowed datasets."
     return True, ""
 
-
 def enforce_limit(sql: str, max_rows: int) -> str:
     if re.search(r"\bLIMIT\s+\d+\b", sql, re.IGNORECASE): return sql
     if re.search(r"\bGROUP\s+BY\b|\bcount\(|\bsum\(|\bavg\(|\bmin\(|\bmax\(|\bQUALIFY\b", sql, re.IGNORECASE): return sql
@@ -236,6 +234,22 @@ def run_sql(sql: str, max_rows: int) -> List[Dict[str, Any]]:
     job = bq.query(sql)
     it = job.result(max_results=max_rows)
     return [dict(row) for row in it]
+
+# --- Auto-inject required CTEs if missing but referenced
+HAS_CTES_PATTERN = re.compile(r"\bwith\b\s+.*\btyped_sales\b\s+as\s*\(", re.IGNORECASE | re.DOTALL)
+REFS_CTES_PATTERN = re.compile(r"\b(?:from|join)\s+(typed_sales|typed_items)\b", re.IGNORECASE)
+
+def ensure_required_ctes(sql: str) -> str:
+    """
+    If the query references typed_sales/typed_items but doesn't include the CTE
+    definitions, prepend the standard dual-CTE block.
+    """
+    s = sql.strip().lstrip(";")
+    if HAS_CTES_PATTERN.search(s):
+        return s  # CTEs already present
+    if REFS_CTES_PATTERN.search(s):
+        return build_typed_ctes() + "\n" + s
+    return s
 
 # Build BOTH typed CTEs (sales + items)
 def build_typed_ctes() -> str:
@@ -411,6 +425,9 @@ with tabs[0]:
                 if not sql:
                     st.error("Model did not return SQL.")
                 else:
+                    # Ensure required CTEs are present if referenced
+                    sql = ensure_required_ctes(sql)
+
                     ok, msg = is_query_safe(sql)
                     if not ok:
                         st.error(f"Blocked: {msg}")
@@ -465,6 +482,9 @@ with tabs[1]:
         if not sql:
             st.warning("Enter a SQL query.")
         else:
+            # Ensure required CTEs are present if referenced
+            sql = ensure_required_ctes(sql)
+
             ok, msg = is_query_safe(sql)
             if not ok:
                 st.error(f"Blocked: {msg}")
