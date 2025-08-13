@@ -234,6 +234,20 @@ def run_sql(sql: str, max_rows: int) -> List[Dict[str, Any]]:
     job = bq.query(sql)
     it = job.result(max_results=max_rows)
     return [dict(row) for row in it]
+# Collapse accidental second WITH into a comma continuation of the first WITH
+DOUBLE_WITH_PATTERN = re.compile(r"\)\s*WITH\s+", re.IGNORECASE)
+
+def normalize_with_blocks(sql: str) -> str:
+    """
+    Ensures a single WITH block by replacing ') WITH' -> '),'
+    Handles cases where the model emits a second WITH after initial CTEs.
+    """
+    s = sql.strip().lstrip(";")
+    # Replace all occurrences safely
+    while DOUBLE_WITH_PATTERN.search(s):
+        s = DOUBLE_WITH_PATTERN.sub("),\n", s, count=1)
+    return s
+
 
 # --- Auto-inject required CTEs if missing but referenced
 HAS_CTES_PATTERN = re.compile(r"\bwith\b\s+.*\btyped_sales\b\s+as\s*\(", re.IGNORECASE | re.DOTALL)
@@ -427,6 +441,7 @@ with tabs[0]:
                 else:
                     # Ensure required CTEs are present if referenced
                     sql = ensure_required_ctes(sql)
+                    sql = normalize_with_blocks(sql)
 
                     ok, msg = is_query_safe(sql)
                     if not ok:
